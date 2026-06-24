@@ -1,3 +1,38 @@
+polyframe
+=========
+
+**Multi-monitor remote desktop for Linux — your remote cursor follows you across monitors.**
+
+> ### 🏴‍☠️ Pirates with ethics
+> **polyframe is a fork of [ReFrame](https://github.com/AlynxZhou/reframe) by [Alynx Zhou](https://github.com/AlynxZhou), licensed under Apache-2.0.**
+> Every bit of the hard part — the DRM/KMS capture, the Wayland/NVIDIA/headless/login support, all of it — is Alynx's work. polyframe only adds cross-monitor cursor handling on top. **If you want the upstream project, go [star ReFrame](https://github.com/AlynxZhou/reframe).**
+
+## What polyframe adds
+
+ReFrame runs one capture/input server **per monitor**, which is the right design — but on Wayland compositors (e.g. COSMIC/`cosmic-comp`) an *absolute* pointer device is confined to a single output, so the system cursor can't move between monitors. polyframe adds **follow-the-cursor**:
+
+- Each per-monitor streamer publishes which monitor currently holds the cursor (detected from the DRM cursor plane each frame) to a small flock-guarded file under `/run/reframe`.
+- When you interact with a monitor that doesn't currently have the cursor, polyframe relocates it there — one short burst of relative motion on a dedicated relative-only `uinput` device (a single huge `REL_X` is ignored/capped by libinput; many small steps a few ms apart are honored, related to [#36](https://github.com/AlynxZhou/reframe/issues/36)) — then forwards the absolute event for precise placement.
+- **Within** a monitor it's pure absolute input, so normal movement stays smooth and pixel-accurate.
+
+### One VNC server per monitor
+
+Like ReFrame, polyframe runs a separate server — and its own VNC port — for **each** monitor (e.g. the left monitor on `:5933`, the right on `:5934`). You connect one client/view per monitor (side-by-side panes work great). Follow-the-cursor ties them together: the single system cursor moves to whichever monitor's view you're driving, then tracks precisely there.
+
+### Config
+
+One new per-monitor key, `position-x` — the monitor's real X position on the virtual desktop (e.g. left monitor `0`, right monitor `1920`). Keep `monitor-x=0` and `desktop-width` at each monitor's own width so absolute positioning stays full-range per monitor. See [`dists/example.conf`](./dists/example.conf).
+
+**Known limitation:** cross-monitor drag-and-drop isn't handled yet.
+
+## Credit & license
+
+polyframe is a derivative of **ReFrame** (<https://github.com/AlynxZhou/reframe>), © Alynx Zhou and contributors, distributed under the **Apache License 2.0** — preserved unchanged in [`LICENSE`](./LICENSE). polyframe's only addition is the multi-monitor follow-the-cursor feature documented above. Please support and star the upstream project.
+
+---
+
+_Alynx's original ReFrame documentation follows, verbatim._
+
 ReFrame Remote Desktop
 ======================
 
