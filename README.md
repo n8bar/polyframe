@@ -29,9 +29,21 @@ One new per-monitor key, `position-x` — the monitor's real X position on the v
 
 polyframe is a derivative of **ReFrame** (<https://github.com/AlynxZhou/reframe>), © Alynx Zhou and contributors, distributed under the **Apache License 2.0** — preserved unchanged in [`LICENSE`](./LICENSE). polyframe's only addition is the multi-monitor follow-the-cursor feature documented above. Please support and star the upstream project.
 
+&nbsp;
+
+---
 ---
 
-_Alynx's original ReFrame documentation follows, verbatim._
+# ⬇️ &nbsp; ORIGINAL ReFrame README BELOW &nbsp; ⬇️
+
+## Everything from here down is [Alynx Zhou](https://github.com/AlynxZhou)'s original ReFrame documentation — included **verbatim and unchanged.**
+
+### polyframe's own additions are documented at the **top** of this file.
+
+---
+---
+
+&nbsp;
 
 ReFrame Remote Desktop
 ======================
