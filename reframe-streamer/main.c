@@ -24,12 +24,11 @@
 
 #define WAKEUP_MAX_EVENTS 4
 
-// Shared file recording which monitor currently owns (shows) the system cursor.
-// It holds one int: the position-x of that monitor. Both per-monitor streamers
-// read/write it under an exclusive flock. The owner is published from the frame
-// path (cursor plane present => we own it); on_input_msg reads it to decide
-// whether the cursor needs to be relocated onto this monitor first.
-#define CURSOR_OWNER_PATH "/run/reframe/cursor-owner"
+// Shared file (named cursor-owner, alongside the socket) recording which monitor
+// currently holds the system cursor. It holds one int: the relocate-origin-x of
+// that monitor. The per-monitor streamers read/write it under an exclusive flock.
+// Ownership is tracked from the input path (last monitor to receive a pointer
+// event); on_input_msg reads it to decide whether to relocate onto this monitor.
 
 // Cross-monitor relocation is emitted as a BURST of small relative steps, not
 // one giant delta: COSMIC/libinput ignores (or caps) a single huge REL_X, but
@@ -78,10 +77,19 @@
 struct this {
 	RfConfig *config;
 	GSocketConnection *connection;
-	// This monitor's real desktop X-position (config key "position-x"). Used
-	// as the monitor's owner identity in CURSOR_OWNER_PATH and to choose the
-	// relocation burst direction. Separate from monitor-x (which stays 0).
-	int position_x;
+	// Cross-monitor cursor relocation (config key "relocate", default off).
+	bool relocate;
+	// This monitor's real desktop X (config key "relocate-origin-x"): owner
+	// identity + burst direction, read only when relocate is set. Separate
+	// from monitor-x.
+	int relocate_origin_x;
+	// Burst direction for the unknown-owner (first input) case, precomputed
+	// from sibling configs: -1 if this is the leftmost monitor, +1 if rightmost.
+	int unknown_dir;
+	// Directory of this streamer's config, for reading sibling configs.
+	char *config_dir;
+	// Path of the shared cursor-owner file (alongside the socket).
+	char *owner_path;
 	char *card_path;
 	char *connector_name;
 	int cfd;
@@ -386,25 +394,25 @@ out:
 	return ret;
 }
 
-// Shared cursor-owner file helpers. The file holds one int: the position-x of
-// the monitor that currently shows the system cursor. Access is serialized with
-// an exclusive flock so the two streamer processes don't race.
+// Shared cursor-owner file helpers. The file holds one int: the relocate-origin-x
+// of the monitor that last received pointer input (i.e. where the cursor is).
+// Access is serialized with an exclusive flock so the streamers don't race.
 
-// Publish that THIS monitor now owns the cursor (called from the frame path when
-// our CRTC has a cursor plane this frame).
+// Record THIS monitor as the cursor owner (called from the input path after
+// relocating the cursor onto this monitor).
 static void cursor_owner_publish(struct this *this)
 {
-	int fd = open(CURSOR_OWNER_PATH, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+	int fd = open(this->owner_path, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
 	if (fd < 0) {
 		g_warning(
 			"Cursor: Failed to open %s for publish: %s.",
-			CURSOR_OWNER_PATH,
+			this->owner_path,
 			strerror(errno)
 		);
 		return;
 	}
 	if (flock(fd, LOCK_EX) == 0) {
-		int v = this->position_x;
+		int v = this->relocate_origin_x;
 		// The file only ever holds one int at offset 0, so a fixed-size
 		// overwrite keeps it exactly sizeof(int) without truncation.
 		if (lseek(fd, 0, SEEK_SET) != 0 ||
@@ -414,16 +422,15 @@ static void cursor_owner_publish(struct this *this)
 	close(fd);
 }
 
-// Read the current owner's position-x. Returns true and sets *owner_x on
-// success; false if the file is missing/empty/unreadable (caller skips
-// relocation in that case).
-static bool cursor_owner_read(int *owner_x)
+// Read the current owner's relocate-origin-x. Returns true and sets *owner_x on
+// success; false if the file is missing/empty/unreadable (unknown owner).
+static bool cursor_owner_read(struct this *this, int *owner_x)
 {
-	int fd = open(CURSOR_OWNER_PATH, O_RDONLY | O_CLOEXEC);
+	int fd = open(this->owner_path, O_RDONLY | O_CLOEXEC);
 	if (fd < 0)
 		return false;
 	bool ok = false;
-	if (flock(fd, LOCK_EX) == 0) {
+	if (flock(fd, LOCK_SH) == 0) {
 		int v = 0;
 		if (read(fd, &v, sizeof(v)) == (ssize_t)sizeof(v)) {
 			*owner_x = v;
@@ -434,11 +441,53 @@ static bool cursor_owner_read(int *owner_x)
 	return ok;
 }
 
-// Optimistically record THIS monitor as the owner after relocating the cursor
-// onto it, so we don't re-burst before the next frame refreshes the file.
-static void cursor_owner_claim(struct this *this)
+// Burst direction for the unknown-owner (first input) case. Reads the sibling
+// monitor configs in this config's directory to find the layout extremes:
+// returns -1 if this monitor is the leftmost (min relocate-origin-x), +1 if the
+// rightmost. A middle monitor (3+ layout) can't be reached by the over-travel
+// burst; default toward the nearer extreme and warn.
+static int compute_unknown_dir(struct this *this)
 {
-	cursor_owner_publish(this);
+	int lo = this->relocate_origin_x;
+	int hi = this->relocate_origin_x;
+	g_autoptr(GDir) gdir = g_dir_open(this->config_dir, 0, NULL);
+	if (gdir != NULL) {
+		const char *name;
+		while ((name = g_dir_read_name(gdir)) != NULL) {
+			if (!g_str_has_suffix(name, ".conf"))
+				continue;
+			g_autofree char *path =
+				g_build_filename(this->config_dir, name, NULL);
+			g_autoptr(RfConfig) sib = rf_config_new(path);
+			if (!rf_config_get_relocate(sib))
+				continue;
+			int ox = rf_config_get_relocate_origin_x(sib);
+			if (ox < lo)
+				lo = ox;
+			if (ox > hi)
+				hi = ox;
+		}
+	}
+	if (lo == hi) {
+		g_warning(
+			"Cursor: %s found no peer monitor with a distinct "
+			"relocate-origin-x; defaulting direction. Set "
+			"relocate-origin-x on all participating monitors.",
+			this->connector_name
+		);
+		return -1;
+	}
+	if (this->relocate_origin_x <= lo)
+		return -1;
+	if (this->relocate_origin_x >= hi)
+		return 1;
+	g_warning(
+		"Cursor: %s is not an outermost monitor; relocation may be imprecise.",
+		this->connector_name
+	);
+	return (this->relocate_origin_x - lo) <= (hi - this->relocate_origin_x) ?
+		       -1 :
+		       1;
 }
 
 static ssize_t on_frame_msg(struct this *this)
@@ -506,13 +555,6 @@ static ssize_t on_frame_msg(struct this *this)
 		// It is OK to ignore cursor plane if failed.
 		if (ret <= 0)
 			--length;
-		else
-			// A cursor plane is present on our CRTC this frame, so
-			// the system cursor is physically on THIS monitor.
-			// Publish ourselves as the owner. When the cursor is on
-			// the other monitor, our CRTC has no cursor plane, so we
-			// don't publish and the other streamer claims it.
-			cursor_owner_publish(this);
 	}
 
 	ret = send_frame_msg(this, length, bufs);
@@ -563,27 +605,30 @@ static ssize_t on_input_msg(struct this *this)
 	if (ret <= 0)
 		goto out;
 
-	// "Follow the stream": this event is for THIS monitor's stream, so the
-	// user wants the cursor here. If the cursor is currently on a DIFFERENT
-	// monitor (owner_x != my_x), first relocate it onto this monitor with a
-	// relative burst (which also flips the active output to us); then forward
-	// the absolute event unchanged, which now positions precisely on this
-	// monitor. If the cursor is already here (or owner is unknown), just
-	// forward the absolute. No edge zones, no thresholds, no ABS override.
-	int owner_x = 0;
-	if (cursor_owner_read(&owner_x) && owner_x != this->position_x) {
-		const int dir = this->position_x > owner_x ? 1 : -1;
-		g_message(
-			"Cursor: Relocating from owner x=%d to this monitor x=%d (dir %d) on %s.",
-			owner_x,
-			this->position_x,
-			dir,
-			this->connector_name
-		);
-		cursor_relocate(this, dir);
-		// Optimistically claim ownership so we don't re-burst before the
-		// next frame refreshes the owner file.
-		cursor_owner_claim(this);
+	// "Follow the stream": this event is for THIS monitor's stream, so the user
+	// wants the cursor here. If relocation is on and the cursor isn't already
+	// here (owner != us, or unknown on the first input), relocate it with a
+	// relative burst, then forward the absolute event for precise placement.
+	// Within a monitor it stays pure absolute.
+	if (this->relocate) {
+		int owner_x = 0;
+		bool known = cursor_owner_read(this, &owner_x);
+		if (!known || owner_x != this->relocate_origin_x) {
+			int dir;
+			if (known)
+				dir = this->relocate_origin_x > owner_x ? 1 : -1;
+			else
+				dir = this->unknown_dir;
+			g_message(
+				"Cursor: Relocating to this monitor x=%d (dir %d) on %s.",
+				this->relocate_origin_x,
+				dir,
+				this->connector_name
+			);
+			cursor_relocate(this, dir);
+			// Claim ownership so we don't re-burst on the next input here.
+			cursor_owner_publish(this);
+		}
 	}
 
 	write_may(this->ufd, ies, length * sizeof(*ies));
@@ -804,14 +849,20 @@ static void setup_drm(struct this *this)
 	send_card_path_msg(this, this->card_path);
 	send_connector_name_msg(this, this->connector_name);
 
-	// This monitor's real desktop position, used for cursor-owner identity
-	// and relocation burst direction (separate from monitor-x).
-	this->position_x = rf_config_get_position_x(this->config);
-	g_message(
-		"Cursor: This monitor position-x is %d on %s.",
-		this->position_x,
-		this->connector_name
-	);
+	// Cursor relocation config. relocate-origin-x is this monitor's real desktop
+	// position (owner identity + burst direction); unknown_dir handles the first
+	// input before any owner is recorded. Both read only when relocate is set.
+	this->relocate = rf_config_get_relocate(this->config);
+	if (this->relocate) {
+		this->relocate_origin_x =
+			rf_config_get_relocate_origin_x(this->config);
+		this->unknown_dir = compute_unknown_dir(this);
+		g_message(
+			"Cursor: Relocation on, relocate-origin-x %d on %s.",
+			this->relocate_origin_x,
+			this->connector_name
+		);
+	}
 }
 
 static void clean_drm(struct this *this)
@@ -874,13 +925,14 @@ static void setup_uinput(struct this *this)
 	ioctl_must(this->ufd, UI_SET_ABSBIT, ABS_X);
 	ioctl_must(this->ufd, UI_SET_ABSBIT, ABS_Y);
 
-	// This device stays ABSOLUTE-ONLY for positioning. We deliberately do
-	// NOT advertise REL_X/REL_Y here: a device that is both absolute and
-	// relative gets classified by COSMIC as an absolute pointer, and its
-	// relative motion is ignored (reframe issue #36). The relocation burst
-	// is emitted on a separate relative-only device (this->ufd_rel) below.
+	// It seems trying to be both touchscreen and mouse leads into bugs,
+	// anyway, we only send absolute coordinates.
 	//
 	// See <https://github.com/AlynxZhou/reframe/issues/36>.
+	// ioctl_must(this->ufd, UI_SET_RELBIT, REL_X);
+	// ioctl_must(this->ufd, UI_SET_RELBIT, REL_Y);
+	// (Relative motion for cross-monitor relocation goes on the separate
+	// relative-only device ufd_rel below.)
 	ioctl_must(this->ufd, UI_SET_RELBIT, REL_WHEEL);
 	ioctl_must(this->ufd, UI_SET_RELBIT, REL_HWHEEL);
 
@@ -901,33 +953,37 @@ static void setup_uinput(struct this *this)
 	ioctl_must(this->ufd, UI_DEV_CREATE);
 
 	// Second device: a pure RELATIVE pointer used ONLY for the cross-monitor
-	// cursor relocation burst. A relative-only device is honored by COSMIC for
-	// cross-monitor motion (verified on the box). We declare BTN_LEFT so libinput
-	// classifies it as a mouse, but we NEVER emit button events on it (the
-	// absolute device keeps button state); this avoids any stuck-button risk.
-	this->ufd_rel = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
-	if (this->ufd_rel < 0)
-		this->ufd_rel = open("/dev/input/uinput", O_WRONLY | O_NONBLOCK);
-	if (this->ufd_rel < 0)
-		g_error(
-			"Input: Failed to open uinput for relative device: %s.",
-			strerror(errno)
-		);
+	// relocation burst, created only when relocation is enabled. A relative-only
+	// device is honored by COSMIC for cross-monitor motion (verified on the box).
+	// We declare BTN_LEFT so libinput classifies it as a mouse, but we NEVER emit
+	// button events on it (the absolute device keeps button state), avoiding any
+	// stuck-button risk.
+	if (rf_config_get_relocate(this->config)) {
+		this->ufd_rel = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
+		if (this->ufd_rel < 0)
+			this->ufd_rel = open("/dev/input/uinput",
+					     O_WRONLY | O_NONBLOCK);
+		if (this->ufd_rel < 0)
+			g_error(
+				"Input: Failed to open uinput for relative device: %s.",
+				strerror(errno)
+			);
 
-	ioctl_must(this->ufd_rel, UI_SET_EVBIT, EV_SYN);
-	ioctl_must(this->ufd_rel, UI_SET_EVBIT, EV_KEY);
-	ioctl_must(this->ufd_rel, UI_SET_EVBIT, EV_REL);
-	ioctl_must(this->ufd_rel, UI_SET_KEYBIT, BTN_LEFT);
-	ioctl_must(this->ufd_rel, UI_SET_RELBIT, REL_X);
-	ioctl_must(this->ufd_rel, UI_SET_RELBIT, REL_Y);
+		ioctl_must(this->ufd_rel, UI_SET_EVBIT, EV_SYN);
+		ioctl_must(this->ufd_rel, UI_SET_EVBIT, EV_KEY);
+		ioctl_must(this->ufd_rel, UI_SET_EVBIT, EV_REL);
+		ioctl_must(this->ufd_rel, UI_SET_KEYBIT, BTN_LEFT);
+		ioctl_must(this->ufd_rel, UI_SET_RELBIT, REL_X);
+		ioctl_must(this->ufd_rel, UI_SET_RELBIT, REL_Y);
 
-	struct uinput_setup dev_rel = { 0 };
-	dev_rel.id.bustype = BUS_USB;
-	dev_rel.id.vendor = 0xa3a7;
-	dev_rel.id.product = 0x0004;
-	strcpy(dev_rel.name, "reframe-rel");
-	ioctl_must(this->ufd_rel, UI_DEV_SETUP, &dev_rel);
-	ioctl_must(this->ufd_rel, UI_DEV_CREATE);
+		struct uinput_setup dev_rel = { 0 };
+		dev_rel.id.bustype = BUS_USB;
+		dev_rel.id.vendor = 0xa3a7;
+		dev_rel.id.product = 0x0004;
+		strcpy(dev_rel.name, "reframe-rel");
+		ioctl_must(this->ufd_rel, UI_DEV_SETUP, &dev_rel);
+		ioctl_must(this->ufd_rel, UI_DEV_CREATE);
+	}
 
 	// If screen is turned off, we cannot get CRTC, so we have to wake it up.
 	this->wakeup = rf_config_get_wakeup(this->config);
@@ -1058,6 +1114,12 @@ int main(int argc, char *argv[])
 	this->ufd_rel = -1;
 	this->skip_auth = skip_auth;
 	this->config = rf_config_new(config_path);
+	// Directory of the config, for reading sibling monitor configs (relocation).
+	this->config_dir =
+		config_path != NULL ? g_path_get_dirname(config_path) : NULL;
+	// Cursor-owner file lives alongside the socket (same writable runtime dir).
+	g_autofree char *socket_dir = g_path_get_dirname(socket_path);
+	this->owner_path = g_build_filename(socket_dir, "cursor-owner", NULL);
 
 	g_autoptr(GSocketListener) listener = g_socket_listener_new();
 
@@ -1167,6 +1229,8 @@ int main(int argc, char *argv[])
 
 	g_socket_listener_close(listener);
 	g_clear_object(&this->config);
+	g_clear_pointer(&this->config_dir, g_free);
+	g_clear_pointer(&this->owner_path, g_free);
 
 	return 0;
 }

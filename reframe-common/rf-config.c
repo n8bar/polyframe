@@ -203,22 +203,34 @@ bool rf_config_get_cursor(RfConfig *this)
 	return cursor;
 }
 
-// The real desktop X-position (in desktop pixels) of this monitor's top-left
-// corner. Used only as the monitor's "owner identity" for cross-monitor cursor
-// relocation and to pick the burst direction; it is SEPARATE from monitor-x
-// (which stays 0 so absolute positioning is full-range within the monitor).
-// Default 0.
-int rf_config_get_position_x(RfConfig *this)
+// Cross-monitor cursor relocation toggle. Default false (stock behaviour).
+bool rf_config_get_relocate(RfConfig *this)
+{
+	g_return_val_if_fail(RF_IS_CONFIG(this), false);
+
+	g_autoptr(GError) error = NULL;
+	int relocate = g_key_file_get_boolean(
+		this->f, RF_CONFIG_GROUP_REFRAME, "relocate", &error
+	);
+	if (error != NULL)
+		return false;
+	return relocate;
+}
+
+// This monitor's real desktop X (top-left). Read only by cursor relocation, for
+// the burst direction and owner identity; not used for pointer mapping (that is
+// monitor-x). Default 0.
+int rf_config_get_relocate_origin_x(RfConfig *this)
 {
 	g_return_val_if_fail(RF_IS_CONFIG(this), 0);
 
 	g_autoptr(GError) error = NULL;
-	int position_x = g_key_file_get_integer(
-		this->f, RF_CONFIG_GROUP_REFRAME, "position-x", &error
+	int relocate_origin_x = g_key_file_get_integer(
+		this->f, RF_CONFIG_GROUP_REFRAME, "relocate-origin-x", &error
 	);
 	if (error != NULL)
 		return 0;
-	return position_x;
+	return relocate_origin_x;
 }
 
 bool rf_config_get_wakeup(RfConfig *this)
