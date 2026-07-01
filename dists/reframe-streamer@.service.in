@@ -2,6 +2,11 @@
 Description=ReFrame Remote Desktop Streamer for %i
 After=reframe@%i.socket
 Requires=reframe@%i.socket
+# Bound restart storms if the streamer keeps failing (e.g. a device error), so a
+# crash loop can't peg a CPU core. A missing/renamed connector is now handled
+# non-fatally in the streamer itself and does not restart-loop.
+StartLimitIntervalSec=30
+StartLimitBurst=5
 
 [Service]
 Type=exec
@@ -19,6 +24,7 @@ DeviceAllow=char-drm r
 DeviceAllow=/dev/uinput rw
 ExecStart=@bindir@/reframe-streamer --config=@confdir@/%i.conf --socket=%t/reframe/%i.sock
 Restart=on-failure
+RestartSec=2
 
 [Install]
 WantedBy=multi-user.target

@@ -991,7 +991,7 @@ get_card_and_connector(struct this *this, const char *connector_name)
 	return get_connector(this->cfd, connector_name);
 }
 
-static void setup_drm(struct this *this)
+static int setup_drm(struct this *this)
 {
 	this->crtc_id = 0;
 	this->primary_id = 0;
@@ -1002,8 +1002,19 @@ static void setup_drm(struct this *this)
 	this->connector_name = rf_config_get_connector(this->config);
 	drmModeConnector *connector =
 		get_card_and_connector(this, this->connector_name);
-	if (connector == NULL)
-		g_error("DRM: Failed to find a usable connector.");
+	if (connector == NULL) {
+		// Non-fatal: a connector that is unplugged or renamed (NVIDIA
+		// renumbers DP outputs across reboots) must not abort the process
+		// and core-dump into a restart loop. Exit this connection cleanly;
+		// the monitor simply isn't streamed until the connector is back.
+		g_warning(
+			"DRM: No usable connector '%s'; not streaming this "
+			"monitor (unplugged or renamed?).",
+			this->connector_name != NULL ? this->connector_name :
+						       "(auto)"
+		);
+		return -1;
+	}
 
 	// We may become DRM master if we are the first process that opens DRM
 	// card, then drop DRM master so we could start compositor after ReFrame.
@@ -1015,9 +1026,13 @@ static void setup_drm(struct this *this)
 
 	drmModeCrtc *crtc = get_crtc(this->cfd, connector);
 	drmModeFreeConnector(connector);
-	if (crtc == NULL)
-		g_error("DRM: Failed to find an active CRTC for connector %s.",
-			this->connector_name);
+	if (crtc == NULL) {
+		g_warning(
+			"DRM: No active CRTC for connector %s; not streaming.",
+			this->connector_name
+		);
+		return -1;
+	}
 	this->crtc_id = crtc->crtc_id;
 	// Monitor pixel width, used as the calibrated-burst target for a middle
 	// monitor (see cursor_relocate).
@@ -1033,8 +1048,10 @@ static void setup_drm(struct this *this)
 
 	this->primary_id =
 		get_plane_id(this->cfd, this->crtc_id, DRM_PLANE_TYPE_PRIMARY);
-	if (this->primary_id == 0)
-		g_error("DRM: Failed to find a primary plane for CRTC.");
+	if (this->primary_id == 0) {
+		g_warning("DRM: No primary plane for CRTC; not streaming.");
+		return -1;
+	}
 	this->cursor = rf_config_get_cursor(this->config);
 	g_message(
 		"DRM: Cursor plane is %s.",
@@ -1065,6 +1082,8 @@ static void setup_drm(struct this *this)
 			this->connector_name
 		);
 	}
+
+	return 0;
 }
 
 static void clean_drm(struct this *this)
@@ -1379,7 +1398,11 @@ int main(int argc, char *argv[])
 		g_message("ReFrame Server connected.");
 
 		setup_uinput(this);
-		setup_drm(this);
+		if (setup_drm(this) < 0) {
+			clean_drm(this);
+			clean_uinput(this);
+			goto close;
+		}
 
 		while (true) {
 			ssize_t ret = 0;
