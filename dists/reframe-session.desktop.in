@@ -1,6 +1,6 @@
 [Desktop Entry]
-Name=ReFrame Session
-Comment=ReFrame Remote Desktop Session
+Name=Polyframe Session
+Comment=Polyframe Remote Desktop Session
 Exec=@bindir@/reframe-session --socket-dir=/run/reframe-session
 Terminal=false
 Type=Application

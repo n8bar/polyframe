@@ -256,7 +256,7 @@ int main(int argc, char *argv[])
 				     NULL,
 				     NULL } };
 	g_autoptr(GOptionContext)
-		context = g_option_context_new(" - ReFrame Session");
+		context = g_option_context_new(" - Polyframe Session");
 	g_option_context_add_main_entries(context, options, NULL);
 	if (!g_option_context_parse(context, &argc, &argv, &error)) {
 		g_warning("Failed to parse options: %s.", error->message);
