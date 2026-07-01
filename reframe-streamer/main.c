@@ -34,11 +34,17 @@
 // one giant delta: COSMIC/libinput ignores (or caps) a single huge REL_X, but
 // honors many small steps spaced a few ms apart (empirically confirmed).
 #define RELOCATE_STEP_PX 40 // px per relative step.
-// 120 * 40 = 4800px > desktop width, so the cursor clamps at this monitor's side
-// no matter which monitor it started on.
-#define RELOCATE_STEP_COUNT 120
+// Anchor over-travel: 120 * 40 = 4800 raw px, and with the measured ~2x gain
+// that is ~9600px effective — larger than any desktop, so the cursor always
+// reaches (and clamps at) the target wall no matter which monitor it started on.
+#define RELOCATE_ANCHOR_STEPS 120
 // Spacing between steps; libinput needs this gap to honor each motion.
 #define RELOCATE_STEP_DELAY_US 3000
+// Measured relative-motion gain on cosmic-comp: landed desktop px per injected
+// raw px is a flat ~1.97x — velocity-independent and linear in displacement (see
+// CHANGELOG.untracked.md, 2026-06-30). Sizes the calibrated middle-monitor burst;
+// the half-monitor landing tolerance makes this rough constant robust.
+#define RELOCATE_GAIN 1.97
 
 // clang-format off
 #define ioctl_must(...)                                                         \
@@ -74,18 +80,27 @@
 	} G_STMT_END
 // clang-format on
 
+// Relocation anchor strategy for this monitor, derived from the layout. An edge
+// monitor over-travels to its own outer wall and clamps inside itself; a middle
+// monitor has no wall of its own, so it anchors at the left wall then fires a
+// calibrated burst right to land within its span.
+enum relocate_pos { RELOCATE_LEFT_EDGE, RELOCATE_RIGHT_EDGE, RELOCATE_MIDDLE };
+
 struct this {
 	RfConfig *config;
 	GSocketConnection *connection;
 	// Cross-monitor cursor relocation (config key "relocate", default off).
 	bool relocate;
 	// This monitor's real desktop X (config key "relocate-origin-x"): owner
-	// identity + burst direction, read only when relocate is set. Separate
-	// from monitor-x.
+	// identity + calibrated-burst target. Separate from monitor-x.
 	int relocate_origin_x;
-	// Burst direction for the unknown-owner (first input) case, precomputed
-	// from sibling configs: -1 if this is the leftmost monitor, +1 if rightmost.
-	int unknown_dir;
+	// Relocation geometry, precomputed from sibling configs + DRM (read only when
+	// relocate is set): kind selects the anchor strategy; left_wall_x is the min
+	// relocate-origin-x across participating monitors (the middle-monitor anchor);
+	// width is this monitor's pixel width (the calibrated-burst target center).
+	enum relocate_pos kind;
+	int left_wall_x;
+	int width;
 	// Directory of this streamer's config, for reading sibling configs.
 	char *config_dir;
 	// Path of the shared cursor-owner file (alongside the socket).
@@ -441,12 +456,13 @@ static bool cursor_owner_read(struct this *this, int *owner_x)
 	return ok;
 }
 
-// Burst direction for the unknown-owner (first input) case. Reads the sibling
-// monitor configs in this config's directory to find the layout extremes:
-// returns -1 if this monitor is the leftmost (min relocate-origin-x), +1 if the
-// rightmost. A middle monitor (3+ layout) can't be reached by the over-travel
-// burst; default toward the nearer extreme and warn.
-static int compute_unknown_dir(struct this *this)
+// Precompute this monitor's relocation geometry from the sibling monitor configs
+// in this config's directory. Finds the layout extremes (min/max relocate-origin-x
+// among relocate-enabled monitors): the min is the left wall (the anchor for a
+// middle monitor), and comparing our origin to the extremes classifies us as left
+// edge, right edge, or middle. An edge clamps against its own outer wall; a middle
+// anchors at the left wall then fires a calibrated burst.
+static void compute_relocate_geometry(struct this *this)
 {
 	int lo = this->relocate_origin_x;
 	int hi = this->relocate_origin_x;
@@ -468,26 +484,23 @@ static int compute_unknown_dir(struct this *this)
 				hi = ox;
 		}
 	}
+	this->left_wall_x = lo;
 	if (lo == hi) {
 		g_warning(
 			"Cursor: %s found no peer monitor with a distinct "
-			"relocate-origin-x; defaulting direction. Set "
+			"relocate-origin-x; treating as an edge. Set "
 			"relocate-origin-x on all participating monitors.",
 			this->connector_name
 		);
-		return -1;
+		this->kind = RELOCATE_LEFT_EDGE;
+		return;
 	}
 	if (this->relocate_origin_x <= lo)
-		return -1;
-	if (this->relocate_origin_x >= hi)
-		return 1;
-	g_warning(
-		"Cursor: %s is not an outermost monitor; relocation may be imprecise.",
-		this->connector_name
-	);
-	return (this->relocate_origin_x - lo) <= (hi - this->relocate_origin_x) ?
-		       -1 :
-		       1;
+		this->kind = RELOCATE_LEFT_EDGE;
+	else if (this->relocate_origin_x >= hi)
+		this->kind = RELOCATE_RIGHT_EDGE;
+	else
+		this->kind = RELOCATE_MIDDLE;
 }
 
 static ssize_t on_frame_msg(struct this *this)
@@ -565,12 +578,10 @@ static ssize_t on_frame_msg(struct this *this)
 	return ret;
 }
 
-// Bring the system cursor onto THIS monitor with a burst of small relative
-// steps on the relative-only device (COSMIC ignores a single huge REL_X but
-// honors many small steps; issue #36 means the slam must come from a non-
-// absolute device). `dir` is the sign of the move. The burst overshoots so the
-// cursor clamps at this monitor's side regardless of where it started.
-static void cursor_relocate(struct this *this, int dir)
+// Emit `steps` small relative REL_X steps (sign = dir) on the relative-only
+// device. COSMIC ignores a single huge REL_X but honors many small steps spaced a
+// few ms apart (issue #36 means the motion must come from a non-absolute device).
+static void relocate_burst(struct this *this, int dir, int steps)
 {
 	struct input_event step[2];
 	memset(step, 0, sizeof(step));
@@ -580,10 +591,37 @@ static void cursor_relocate(struct this *this, int dir)
 	step[1].type = EV_SYN;
 	step[1].code = SYN_REPORT;
 	step[1].value = 0;
-	for (int i = 0; i < RELOCATE_STEP_COUNT; ++i) {
+	for (int i = 0; i < steps; ++i) {
 		write_may(this->ufd_rel, step, sizeof(step));
 		g_usleep(RELOCATE_STEP_DELAY_US);
 	}
+}
+
+// Bring the system cursor onto THIS monitor, from wherever it currently is.
+// Phase 1 (anchor): over-travel to a known desktop wall so the cursor's absolute
+// position becomes known regardless of its start. For an edge monitor the wall is
+// our own outer edge, so clamping already lands the cursor inside our span and the
+// forwarded absolute event snaps it precisely — done. Phase 2 (middle only): a
+// middle monitor has no wall of its own, so it anchors at the LEFT wall (known
+// exactly = min relocate-origin-x) then bursts right by a calibrated amount to land
+// somewhere inside its span; the following absolute event then snaps it precisely.
+static void cursor_relocate(struct this *this)
+{
+	int anchor_dir = (this->kind == RELOCATE_RIGHT_EDGE) ? 1 : -1;
+	relocate_burst(this, anchor_dir, RELOCATE_ANCHOR_STEPS);
+	if (this->kind != RELOCATE_MIDDLE)
+		return;
+
+	// Aim for our center for maximum landing tolerance. Injected raw px = desired
+	// desktop px / measured gain; the half-monitor window makes the rough constant
+	// safe. (crtc width is in monitor pixels — exact in desktop coords only at
+	// scale 100%; the tolerance absorbs any scaling difference.)
+	int target_x = this->relocate_origin_x + this->width / 2;
+	int desktop_px = target_x - this->left_wall_x;
+	if (desktop_px < 0)
+		desktop_px = 0;
+	int steps = (int)(desktop_px / RELOCATE_GAIN) / RELOCATE_STEP_PX;
+	relocate_burst(this, 1, steps);
 }
 
 static ssize_t on_input_msg(struct this *this)
@@ -614,18 +652,15 @@ static ssize_t on_input_msg(struct this *this)
 		int owner_x = 0;
 		bool known = cursor_owner_read(this, &owner_x);
 		if (!known || owner_x != this->relocate_origin_x) {
-			int dir;
-			if (known)
-				dir = this->relocate_origin_x > owner_x ? 1 : -1;
-			else
-				dir = this->unknown_dir;
+			// The anchor+burst is start-position-independent (it over-travels
+			// to a known wall first), so the current owner only decides
+			// WHETHER to relocate, not which direction.
 			g_message(
-				"Cursor: Relocating to this monitor x=%d (dir %d) on %s.",
+				"Cursor: Relocating to this monitor x=%d on %s.",
 				this->relocate_origin_x,
-				dir,
 				this->connector_name
 			);
-			cursor_relocate(this, dir);
+			cursor_relocate(this);
 			// Claim ownership so we don't re-burst on the next input here.
 			cursor_owner_publish(this);
 		}
@@ -827,6 +862,9 @@ static void setup_drm(struct this *this)
 		g_error("DRM: Failed to find an active CRTC for connector %s.",
 			this->connector_name);
 	this->crtc_id = crtc->crtc_id;
+	// Monitor pixel width, used as the calibrated-burst target for a middle
+	// monitor (see cursor_relocate).
+	this->width = crtc->width;
 	drmModeFreeCrtc(crtc);
 
 	// This is needed to get primary and cursor planes.
@@ -850,16 +888,23 @@ static void setup_drm(struct this *this)
 	send_connector_name_msg(this, this->connector_name);
 
 	// Cursor relocation config. relocate-origin-x is this monitor's real desktop
-	// position (owner identity + burst direction); unknown_dir handles the first
-	// input before any owner is recorded. Both read only when relocate is set.
+	// position (owner identity + calibrated-burst target); compute_relocate_geometry
+	// derives the anchor strategy from the layout. All read only when relocate is set.
 	this->relocate = rf_config_get_relocate(this->config);
 	if (this->relocate) {
 		this->relocate_origin_x =
 			rf_config_get_relocate_origin_x(this->config);
-		this->unknown_dir = compute_unknown_dir(this);
+		compute_relocate_geometry(this);
+		static const char *const kind_name[] = { "left-edge",
+							 "right-edge",
+							 "middle" };
 		g_message(
-			"Cursor: Relocation on, relocate-origin-x %d on %s.",
+			"Cursor: Relocation on, relocate-origin-x %d (%s, "
+			"left-wall %d, width %d) on %s.",
 			this->relocate_origin_x,
+			kind_name[this->kind],
+			this->left_wall_x,
+			this->width,
 			this->connector_name
 		);
 	}
