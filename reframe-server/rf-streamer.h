@@ -37,6 +37,15 @@ void rf_streamer_send_pointer_event(
 	bool wright
 );
 void rf_streamer_auth(RfStreamer *this, pid_t pid);
+// `mons` is an array of `n` monitor rectangles (see struct rf_monitor in
+// rf-common.h), forwarded from the session's live GdkMonitor layout so the
+// session-less streamer can relocate the cursor in 2-D.
+struct rf_monitor;
+void rf_streamer_send_layout(
+	RfStreamer *this,
+	const struct rf_monitor *mons,
+	unsigned int n
+);
 
 G_END_DECLS
 

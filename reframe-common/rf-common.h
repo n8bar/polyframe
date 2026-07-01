@@ -21,7 +21,8 @@ G_BEGIN_DECLS
  *
  * The payload length is the number of elements. For frame type, 0 is always the
  * primary plane, follows with an optional cursor plane. The payload length could
- * be 0 for frame type, which means the monitor is currently empty.
+ * be 0 for frame type, which means the monitor is currently empty. For layout
+ * type, the length is the number of monitors (`struct rf_monitor` elements).
  */
 #define RF_MSG_TYPE_FRAME 'F'
 #define RF_MSG_TYPE_INPUT 'I'
@@ -29,12 +30,17 @@ G_BEGIN_DECLS
 #define RF_MSG_TYPE_CONNECTOR_NAME 'N'
 #define RF_MSG_TYPE_CLIPBOARD_TEXT 'T'
 #define RF_MSG_TYPE_AUTH 'A'
+#define RF_MSG_TYPE_LAYOUT 'L'
 
 #define RF_KEYBOARD_MAX 256
 #define RF_POINTER_MAX INT16_MAX
 
 #define RF_MAX_BUFS 2
 #define RF_MAX_FDS 4
+
+// Upper bound on monitors in an RF_MSG_TYPE_LAYOUT message; bounds the receive
+// allocation against a corrupt or desynced length.
+#define RF_MONITOR_MAX 64
 
 #define RF_KEY_CODE_XKB_TO_EV(key_code) ((key_code) - 8)
 
@@ -80,6 +86,22 @@ struct rf_rect {
 struct rf_auth {
 	pid_t pid;
 	bool ok;
+};
+
+// Max bytes for a DRM connector name (e.g. "HDMI-A-1", "DP-1"), NUL included.
+#define RF_CONNECTOR_MAX 32
+
+// One monitor's logical desktop rectangle, keyed by DRM connector name.
+// reframe-session enumerates these live (GdkMonitor) and pushes them
+// Session -> Server -> Streamer as an RF_MSG_TYPE_LAYOUT payload (length is the
+// number of monitors) so the session-less Streamer can relocate the cursor in
+// 2-D without hand-transcribed config geometry. x/y may be negative.
+struct rf_monitor {
+	char connector[RF_CONNECTOR_MAX];
+	int32_t x;
+	int32_t y;
+	uint32_t w;
+	uint32_t h;
 };
 
 void rf_buffer_debug(struct rf_buffer *b);

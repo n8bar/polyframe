@@ -763,3 +763,39 @@ void rf_streamer_auth(RfStreamer *this, pid_t pid)
 
 	send_auth_msg(this, pid);
 }
+
+void rf_streamer_send_layout(
+	RfStreamer *this,
+	const struct rf_monitor *mons,
+	unsigned int n
+)
+{
+	g_return_if_fail(RF_IS_STREAMER(this));
+
+	if (!this->running)
+		return;
+
+	ssize_t ret = 0;
+	g_autoptr(GError) error = NULL;
+	GOutputStream *os =
+		g_io_stream_get_output_stream(G_IO_STREAM(this->connection));
+
+	ret = rf_send_header(this->connection, RF_MSG_TYPE_LAYOUT, n, &error);
+	if (ret <= 0)
+		goto out;
+	ret = g_output_stream_write(os, mons, n * sizeof(*mons), NULL, &error);
+
+out:
+	if (ret < 0) {
+		g_warning(
+			"Layout: Failed to send monitor layout: %s.",
+			error->message
+		);
+		rf_streamer_stop(this);
+	} else if (ret > 0) {
+		g_debug("Layout: Sent %u monitors to streamer.", n);
+	} else {
+		g_warning("ReFrame Streamer disconnected.");
+		rf_streamer_stop(this);
+	}
+}

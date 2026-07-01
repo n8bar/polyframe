@@ -319,6 +319,12 @@ int main(int argc, char *argv[])
 		this->streamer
 	);
 	g_signal_connect_swapped(
+		this->session,
+		"layout",
+		G_CALLBACK(rf_streamer_send_layout),
+		this->streamer
+	);
+	g_signal_connect_swapped(
 		this->streamer,
 		"auth",
 		G_CALLBACK(rf_session_auth),

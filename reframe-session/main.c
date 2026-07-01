@@ -55,6 +55,109 @@ send_clipboard_text_msg(struct this *this, const char *clipboard_text)
 	}
 }
 
+// Enumerate the live monitor layout (GdkMonitor gives the compositor's logical
+// x/y/w/h and the DRM connector name) and broadcast it to every connected server,
+// which relays it to its streamer. The session-less streamer needs this to
+// relocate the cursor across monitors without hand-transcribed config geometry.
+static void send_layout_msg(struct this *this)
+{
+	GListModel *monitors = gdk_display_get_monitors(this->display);
+	unsigned int n = g_list_model_get_n_items(monitors);
+	if (n == 0)
+		return;
+	g_autofree struct rf_monitor *mons = g_new0(struct rf_monitor, n);
+	for (unsigned int i = 0; i < n; i++) {
+		g_autoptr(GdkMonitor)
+			monitor = g_list_model_get_item(monitors, i);
+		GdkRectangle geometry;
+		gdk_monitor_get_geometry(monitor, &geometry);
+		const char *connector = gdk_monitor_get_connector(monitor);
+		if (connector != NULL)
+			g_strlcpy(
+				mons[i].connector, connector, RF_CONNECTOR_MAX
+			);
+		mons[i].x = geometry.x;
+		mons[i].y = geometry.y;
+		mons[i].w = geometry.width;
+		mons[i].h = geometry.height;
+	}
+
+	GHashTableIter it;
+	void *key;
+	void *value;
+	g_hash_table_iter_init(&it, this->sockets);
+	while (g_hash_table_iter_next(&it, &key, &value)) {
+		ssize_t ret = 0;
+		g_autoptr(GError) error = NULL;
+		g_autoptr(GSocketConnection) connection =
+			g_socket_connection_factory_create_connection(key);
+		GOutputStream *os =
+			g_io_stream_get_output_stream(G_IO_STREAM(connection));
+		ret = rf_send_header(connection, RF_MSG_TYPE_LAYOUT, n, &error);
+		if (ret <= 0)
+			goto next;
+		ret = g_output_stream_write(
+			os, mons, n * sizeof(*mons), NULL, &error
+		);
+	next:
+		if (ret <= 0) {
+			if (ret < 0)
+				g_warning(
+					"Failed to send monitor layout: %s.",
+					error->message
+				);
+			else
+				g_message("ReFrame Server disconnected.");
+			g_source_destroy(value);
+			g_hash_table_iter_remove(&it);
+		}
+	}
+}
+
+static void on_monitor_notify(GdkMonitor *monitor, GParamSpec *pspec, void *data)
+{
+	struct this *this = data;
+	g_debug("Layout: Monitor geometry changed, resending layout.");
+	send_layout_msg(this);
+}
+
+// (Re)subscribe to per-monitor geometry changes. `items-changed` on the monitor
+// list only fires on plug/unplug; a monitor moved or resized in place emits
+// `notify::geometry` instead. Disconnect first so this stays idempotent across
+// repeated calls (e.g. from `items-changed`).
+static void subscribe_monitors(struct this *this)
+{
+	GListModel *monitors = gdk_display_get_monitors(this->display);
+	unsigned int n = g_list_model_get_n_items(monitors);
+	for (unsigned int i = 0; i < n; i++) {
+		g_autoptr(GdkMonitor)
+			monitor = g_list_model_get_item(monitors, i);
+		g_signal_handlers_disconnect_by_func(
+			monitor, on_monitor_notify, this
+		);
+		g_signal_connect(
+			monitor,
+			"notify::geometry",
+			G_CALLBACK(on_monitor_notify),
+			this
+		);
+	}
+}
+
+static void on_monitors_changed(
+	GListModel *monitors,
+	unsigned int position,
+	unsigned int removed,
+	unsigned int added,
+	void *data
+)
+{
+	struct this *this = data;
+	g_debug("Layout: Monitors added/removed, resending layout.");
+	subscribe_monitors(this);
+	send_layout_msg(this);
+}
+
 static void
 on_read_text_finish(GObject *source_object, GAsyncResult *res, void *data)
 {
@@ -185,6 +288,10 @@ static void connect(struct this *this, const char *socket_path)
 	g_source_set_callback(source, G_SOURCE_FUNC(on_socket_in), this, NULL);
 	g_source_attach(source, NULL);
 	g_hash_table_insert(this->sockets, g_object_ref(socket), source);
+
+	// A newly connected server (e.g. a socket-activated streamer's server that
+	// just came up) needs the current layout right away.
+	send_layout_msg(this);
 }
 
 static void on_changed(
@@ -306,6 +413,15 @@ int main(int argc, char *argv[])
 		g_object_unref,
 		(GDestroyNotify)g_source_unref
 	);
+
+	// Keep the monitor layout in sync: `items-changed` covers plug/unplug,
+	// per-monitor `notify::geometry` covers rearrange/resize. The initial push
+	// happens as servers connect (see connect()).
+	GListModel *monitors = gdk_display_get_monitors(this->display);
+	g_signal_connect(
+		monitors, "items-changed", G_CALLBACK(on_monitors_changed), this
+	);
+	subscribe_monitors(this);
 
 	g_autoptr(GDir) dir = g_dir_open(socket_dir, 0, NULL);
 	if (dir != NULL) {

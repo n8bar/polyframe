@@ -19,7 +19,7 @@ struct _RfSession {
 };
 G_DEFINE_TYPE(RfSession, rf_session, G_TYPE_OBJECT)
 
-enum { SIG_START, SIG_STOP, SIG_CLIPBOARD_TEXT, SIG_AUTH, N_SIGS };
+enum { SIG_START, SIG_STOP, SIG_CLIPBOARD_TEXT, SIG_AUTH, SIG_LAYOUT, N_SIGS };
 
 static unsigned int sigs[N_SIGS] = { 0 };
 
@@ -54,6 +54,40 @@ out:
 	return ret;
 }
 
+static ssize_t on_layout_msg(RfSession *this, GSocketConnection *connection)
+{
+	size_t length = 0;
+	ssize_t ret = 0;
+	g_autofree struct rf_monitor *mons = NULL;
+	g_autoptr(GError) error = NULL;
+	GInputStream *is =
+		g_io_stream_get_input_stream(G_IO_STREAM(connection));
+
+	ret = g_input_stream_read(is, &length, sizeof(length), NULL, &error);
+	if (ret <= 0)
+		goto out;
+	if (length == 0 || length > RF_MONITOR_MAX) {
+		g_warning("Layout: Invalid monitor count %zu; dropping.", length);
+		return -1;
+	}
+
+	mons = g_new0(struct rf_monitor, length);
+	ret = g_input_stream_read(is, mons, length * sizeof(*mons), NULL, &error);
+	if (ret <= 0)
+		goto out;
+
+	g_signal_emit(this, sigs[SIG_LAYOUT], 0, mons, (unsigned int)length);
+
+out:
+	if (ret < 0)
+		g_warning(
+			"Failed to receive monitor layout: %s.", error->message
+		);
+	else if (ret > 0)
+		g_debug("Layout: Received %zu monitors.", length);
+	return ret;
+}
+
 static int on_socket_in(GSocket *socket, GIOCondition condition, void *data)
 {
 	RfSession *this = data;
@@ -81,6 +115,9 @@ static int on_socket_in(GSocket *socket, GIOCondition condition, void *data)
 	switch (type) {
 	case RF_MSG_TYPE_CLIPBOARD_TEXT:
 		ret = on_clipboard_text_msg(this, connection);
+		break;
+	case RF_MSG_TYPE_LAYOUT:
+		ret = on_layout_msg(this, connection);
 		break;
 	default:
 		break;
@@ -177,6 +214,19 @@ static void rf_session_class_init(RfSessionClass *klass)
 		G_TYPE_NONE,
 		1,
 		G_TYPE_INT
+	);
+	sigs[SIG_LAYOUT] = g_signal_new(
+		"layout",
+		RF_TYPE_SESSION,
+		0,
+		0,
+		NULL,
+		NULL,
+		NULL,
+		G_TYPE_NONE,
+		2,
+		G_TYPE_POINTER,
+		G_TYPE_UINT
 	);
 }
 

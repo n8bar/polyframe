@@ -101,6 +101,12 @@ struct this {
 	enum relocate_pos kind;
 	int left_wall_x;
 	int width;
+	// Live monitor layout pushed from the session (RF_MSG_TYPE_LAYOUT), NULL
+	// until the first push. When present it supersedes the config-derived
+	// geometry above and drives 2-D relocation; when absent (login screen /
+	// headless) relocation falls back to the config sibling-scan + 1-D burst.
+	struct rf_monitor *layout;
+	unsigned int layout_n;
 	// Directory of this streamer's config, for reading sibling configs.
 	char *config_dir;
 	// Path of the shared cursor-owner file (alongside the socket).
@@ -409,9 +415,9 @@ out:
 	return ret;
 }
 
-// Shared cursor-owner file helpers. The file holds one int: the relocate-origin-x
-// of the monitor that last received pointer input (i.e. where the cursor is).
-// Access is serialized with an exclusive flock so the streamers don't race.
+// Shared cursor-owner file helpers. The file holds the DRM connector name of the
+// monitor that last received pointer input (i.e. where the cursor is). Access is
+// serialized with an exclusive flock so the streamers don't race.
 
 // Record THIS monitor as the cursor owner (called from the input path after
 // relocating the cursor onto this monitor).
@@ -427,28 +433,33 @@ static void cursor_owner_publish(struct this *this)
 		return;
 	}
 	if (flock(fd, LOCK_EX) == 0) {
-		int v = this->relocate_origin_x;
-		// The file only ever holds one int at offset 0, so a fixed-size
-		// overwrite keeps it exactly sizeof(int) without truncation.
+		const char *name = this->connector_name != NULL ?
+					   this->connector_name :
+					   "";
+		size_t len = strlen(name) + 1;
+		// Overwrite AND truncate under the lock (never truncate at open() via
+		// O_TRUNC, which happens before flock and would let a sibling reading
+		// under LOCK_SH momentarily see an empty file -> spurious relocate).
 		if (lseek(fd, 0, SEEK_SET) != 0 ||
-		    write(fd, &v, sizeof(v)) != (ssize_t)sizeof(v))
-			g_warning("Cursor: Failed to write owner position.");
+		    write(fd, name, len) != (ssize_t)len ||
+		    ftruncate(fd, len) != 0)
+			g_warning("Cursor: Failed to write owner identity.");
 	}
 	close(fd);
 }
 
-// Read the current owner's relocate-origin-x. Returns true and sets *owner_x on
-// success; false if the file is missing/empty/unreadable (unknown owner).
-static bool cursor_owner_read(struct this *this, int *owner_x)
+// Read the current owner's connector name into `owner` (NUL-terminated). Returns
+// true on success; false if the file is missing/empty/unreadable (unknown owner).
+static bool cursor_owner_read(struct this *this, char *owner, size_t owner_size)
 {
 	int fd = open(this->owner_path, O_RDONLY | O_CLOEXEC);
 	if (fd < 0)
 		return false;
 	bool ok = false;
 	if (flock(fd, LOCK_SH) == 0) {
-		int v = 0;
-		if (read(fd, &v, sizeof(v)) == (ssize_t)sizeof(v)) {
-			*owner_x = v;
+		ssize_t n = read(fd, owner, owner_size - 1);
+		if (n > 0) {
+			owner[n] = '\0';
 			ok = true;
 		}
 	}
@@ -578,15 +589,16 @@ static ssize_t on_frame_msg(struct this *this)
 	return ret;
 }
 
-// Emit `steps` small relative REL_X steps (sign = dir) on the relative-only
-// device. COSMIC ignores a single huge REL_X but honors many small steps spaced a
-// few ms apart (issue #36 means the motion must come from a non-absolute device).
-static void relocate_burst(struct this *this, int dir, int steps)
+// Emit `steps` small relative steps (axis = REL_X/REL_Y, sign = dir) on the
+// relative-only device. COSMIC ignores a single huge relative delta but honors
+// many small steps spaced a few ms apart (issue #36 means the motion must come
+// from a non-absolute device).
+static void relocate_burst(struct this *this, int axis, int dir, int steps)
 {
 	struct input_event step[2];
 	memset(step, 0, sizeof(step));
 	step[0].type = EV_REL;
-	step[0].code = REL_X;
+	step[0].code = axis;
 	step[0].value = dir * RELOCATE_STEP_PX;
 	step[1].type = EV_SYN;
 	step[1].code = SYN_REPORT;
@@ -597,31 +609,122 @@ static void relocate_burst(struct this *this, int dir, int steps)
 	}
 }
 
-// Bring the system cursor onto THIS monitor, from wherever it currently is.
-// Phase 1 (anchor): over-travel to a known desktop wall so the cursor's absolute
-// position becomes known regardless of its start. For an edge monitor the wall is
-// our own outer edge, so clamping already lands the cursor inside our span and the
-// forwarded absolute event snaps it precisely — done. Phase 2 (middle only): a
-// middle monitor has no wall of its own, so it anchors at the LEFT wall (known
-// exactly = min relocate-origin-x) then bursts right by a calibrated amount to land
-// somewhere inside its span; the following absolute event then snaps it precisely.
+// Find this monitor's own rect in the pushed layout by DRM connector name, or
+// NULL if there is no layout / it is absent (then relocation uses the config
+// fallback below).
+static const struct rf_monitor *layout_self(struct this *this)
+{
+	for (unsigned int i = 0; i < this->layout_n; ++i) {
+		if (g_strcmp0(this->layout[i].connector,
+			      this->connector_name) == 0)
+			return &this->layout[i];
+	}
+	return NULL;
+}
+
+// 2-D relocation from the live layout: (1) anchor at the desktop's top-left
+// corner (over-travel left, then up); (2) drop into the monitors' common
+// Y-overlap band; (3) sweep right to our horizontal center. Down-before-right
+// keeps the path inside the monitor union at every crossing, so a monitor that is
+// vertically offset from the anchor (e.g. below the leftmost's top strip) is still
+// reached — this is what a horizontal-only burst could not do. The huge landing
+// tolerance (half a monitor wide, ~a whole band tall) absorbs the rough gain; the
+// following absolute event snaps the cursor precisely.
+static void
+cursor_relocate_layout(struct this *this, const struct rf_monitor *self)
+{
+	int min_x = self->x;
+	int min_y = self->y;
+	int max_right = self->x + (int)self->w;
+	int max_bottom = self->y + (int)self->h;
+	int anchor_y = self->y; // top of the leftmost column (the anchor corner)
+	int band_top = self->y;
+	int band_bottom = self->y + (int)self->h;
+	for (unsigned int i = 0; i < this->layout_n; ++i) {
+		const struct rf_monitor *m = &this->layout[i];
+		if (m->x < min_x) {
+			min_x = m->x;
+			anchor_y = m->y;
+		} else if (m->x == min_x && m->y < anchor_y) {
+			// Topmost monitor of the leftmost column: the up-anchor
+			// clamps here, so the drop is measured from this row.
+			anchor_y = m->y;
+		}
+		if (m->y < min_y)
+			min_y = m->y;
+		if (m->x + (int)m->w > max_right)
+			max_right = m->x + (int)m->w;
+		if (m->y + (int)m->h > max_bottom)
+			max_bottom = m->y + (int)m->h;
+		if (m->y > band_top)
+			band_top = m->y;
+		if (m->y + (int)m->h < band_bottom)
+			band_bottom = m->y + (int)m->h;
+	}
+
+	// Over-travel enough to clamp even on a desktop wider/taller than a fixed
+	// step count would cover: the full span (through the gain) plus the margin.
+	int anchor_x_steps =
+		(int)((max_right - min_x) / RELOCATE_GAIN) / RELOCATE_STEP_PX +
+		RELOCATE_ANCHOR_STEPS;
+	int anchor_y_steps =
+		(int)((max_bottom - min_y) / RELOCATE_GAIN) / RELOCATE_STEP_PX +
+		RELOCATE_ANCHOR_STEPS;
+
+	// Phase 1: anchor at (min_x, top of the leftmost column).
+	relocate_burst(this, REL_X, -1, anchor_x_steps);
+	relocate_burst(this, REL_Y, -1, anchor_y_steps);
+
+	// Phase 2: drop to the common band's center (max tolerance). If the monitors
+	// share no common band (exotic layout), aim for our own vertical center.
+	int target_y = band_bottom > band_top ? (band_top + band_bottom) / 2 :
+						self->y + (int)self->h / 2;
+	int down_px = target_y - anchor_y;
+	if (down_px > 0)
+		relocate_burst(
+			this,
+			REL_Y,
+			1,
+			(int)(down_px / RELOCATE_GAIN) / RELOCATE_STEP_PX
+		);
+
+	// Phase 3: sweep right to our horizontal center.
+	int target_x = self->x + (int)self->w / 2;
+	int right_px = target_x - min_x;
+	if (right_px > 0)
+		relocate_burst(
+			this,
+			REL_X,
+			1,
+			(int)(right_px / RELOCATE_GAIN) / RELOCATE_STEP_PX
+		);
+}
+
+// Bring the system cursor onto THIS monitor from wherever it currently is. Prefer
+// the live layout (full 2-D). Fall back to the config-derived 1-D anchor+burst
+// (login screen / headless, or a monitor absent from the layout): over-travel to a
+// known wall; an edge monitor clamps inside itself and is done, a middle monitor
+// then bursts right by a calibrated amount to land within its span. Either way the
+// following absolute event snaps the cursor precisely.
 static void cursor_relocate(struct this *this)
 {
+	const struct rf_monitor *self =
+		this->layout != NULL ? layout_self(this) : NULL;
+	if (self != NULL) {
+		cursor_relocate_layout(this, self);
+		return;
+	}
+
 	int anchor_dir = (this->kind == RELOCATE_RIGHT_EDGE) ? 1 : -1;
-	relocate_burst(this, anchor_dir, RELOCATE_ANCHOR_STEPS);
+	relocate_burst(this, REL_X, anchor_dir, RELOCATE_ANCHOR_STEPS);
 	if (this->kind != RELOCATE_MIDDLE)
 		return;
-
-	// Aim for our center for maximum landing tolerance. Injected raw px = desired
-	// desktop px / measured gain; the half-monitor window makes the rough constant
-	// safe. (crtc width is in monitor pixels — exact in desktop coords only at
-	// scale 100%; the tolerance absorbs any scaling difference.)
 	int target_x = this->relocate_origin_x + this->width / 2;
 	int desktop_px = target_x - this->left_wall_x;
 	if (desktop_px < 0)
 		desktop_px = 0;
 	int steps = (int)(desktop_px / RELOCATE_GAIN) / RELOCATE_STEP_PX;
-	relocate_burst(this, 1, steps);
+	relocate_burst(this, REL_X, 1, steps);
 }
 
 static ssize_t on_input_msg(struct this *this)
@@ -649,15 +752,14 @@ static ssize_t on_input_msg(struct this *this)
 	// relative burst, then forward the absolute event for precise placement.
 	// Within a monitor it stays pure absolute.
 	if (this->relocate) {
-		int owner_x = 0;
-		bool known = cursor_owner_read(this, &owner_x);
-		if (!known || owner_x != this->relocate_origin_x) {
+		char owner[RF_CONNECTOR_MAX] = { 0 };
+		bool known = cursor_owner_read(this, owner, sizeof(owner));
+		if (!known || g_strcmp0(owner, this->connector_name) != 0) {
 			// The anchor+burst is start-position-independent (it over-travels
-			// to a known wall first), so the current owner only decides
+			// to a known corner first), so the current owner only decides
 			// WHETHER to relocate, not which direction.
 			g_message(
-				"Cursor: Relocating to this monitor x=%d on %s.",
-				this->relocate_origin_x,
+				"Cursor: Relocating to this monitor %s.",
 				this->connector_name
 			);
 			cursor_relocate(this);
@@ -678,6 +780,61 @@ out:
 		g_debug("Input: Received %lu * %ld bytes input events.",
 			length,
 			sizeof(*ies));
+	return ret;
+}
+
+// Adopt the live monitor layout pushed from the session (via the server). It
+// supersedes the config-derived geometry and enables 2-D relocation.
+static ssize_t on_layout_msg(struct this *this)
+{
+	size_t length = 0;
+	ssize_t ret = 0;
+	bool found = false;
+	g_autofree struct rf_monitor *mons = NULL;
+	g_autoptr(GError) error = NULL;
+	GInputStream *is =
+		g_io_stream_get_input_stream(G_IO_STREAM(this->connection));
+
+	ret = g_input_stream_read(is, &length, sizeof(length), NULL, &error);
+	if (ret <= 0)
+		goto out;
+	if (length == 0 || length > RF_MONITOR_MAX) {
+		g_warning("Layout: Invalid monitor count %zu; dropping.", length);
+		return -1;
+	}
+	mons = g_new0(struct rf_monitor, length);
+	ret = g_input_stream_read(is, mons, length * sizeof(*mons), NULL, &error);
+	if (ret <= 0)
+		goto out;
+
+	// Only adopt a layout that actually describes this monitor; this guards
+	// against a stray/foreign session (e.g. a remote virtual desktop) pushing
+	// geometry for a different set of outputs.
+	for (size_t i = 0; i < length; ++i) {
+		if (g_strcmp0(mons[i].connector, this->connector_name) == 0) {
+			found = true;
+			break;
+		}
+	}
+	if (found) {
+		g_clear_pointer(&this->layout, g_free);
+		this->layout = g_steal_pointer(&mons);
+		this->layout_n = (unsigned int)length;
+		g_debug("Layout: Adopted %zu monitors for relocation.", length);
+	} else {
+		g_warning(
+			"Layout: %zu monitors received but none match %s; ignoring.",
+			length,
+			this->connector_name != NULL ? this->connector_name : "?"
+		);
+	}
+
+out:
+	if (ret < 0)
+		g_warning(
+			"Layout: Failed to receive monitor layout: %s.",
+			error->message
+		);
 	return ret;
 }
 
@@ -1251,6 +1408,9 @@ int main(int argc, char *argv[])
 			case RF_MSG_TYPE_INPUT:
 				ret = on_input_msg(this);
 				break;
+			case RF_MSG_TYPE_LAYOUT:
+				ret = on_layout_msg(this);
+				break;
 			case RF_MSG_TYPE_AUTH:
 				ret = on_auth_msg(this);
 				break;
@@ -1276,6 +1436,7 @@ int main(int argc, char *argv[])
 	g_clear_object(&this->config);
 	g_clear_pointer(&this->config_dir, g_free);
 	g_clear_pointer(&this->owner_path, g_free);
+	g_clear_pointer(&this->layout, g_free);
 
 	return 0;
 }
