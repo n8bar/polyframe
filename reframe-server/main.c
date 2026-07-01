@@ -22,6 +22,11 @@ struct this {
 	unsigned int rotation;
 	double aspect_ratio;
 	bool skip_damage;
+	// Last monitor layout the session pushed, cached so it can be re-pushed to
+	// the streamer whenever a client (re)connects and the streamer restarts —
+	// otherwise relocation silently falls back to config-only 1-D.
+	struct rf_monitor *layout;
+	unsigned int layout_n;
 };
 
 static void on_resize_event(RfVNCServer *v, int width, int height, void *data)
@@ -89,8 +94,12 @@ static void on_first_client(RfVNCServer *v, void *data)
 	this->rotation = rf_config_get_rotation(this->config);
 	this->width = rf_config_get_default_width(this->config);
 	this->height = rf_config_get_default_height(this->config);
-	// We always recalculate this on frame so here is not important.
-	this->aspect_ratio = 1.0;
+	// Seed the aspect ratio from the configured size. on_frame recomputes it
+	// from real dimensions, but a client resize can arrive before the first
+	// frame; a 1.0 default squares the view until then.
+	this->aspect_ratio = (this->width > 0 && this->height > 0) ?
+				     (double)this->width / this->height :
+				     1.0;
 
 	if (rf_streamer_start(this->streamer) < 0)
 		rf_vnc_server_flush(this->vnc);
@@ -102,6 +111,36 @@ static void on_last_client(RfVNCServer *v, void *data)
 
 	rf_converter_stop(this->converter);
 	rf_streamer_stop(this->streamer);
+}
+
+// Cache the layout the session pushes (so it can be re-pushed on reconnect) and
+// forward it to the streamer now.
+static void on_layout(
+	RfSession *s,
+	struct rf_monitor *mons,
+	unsigned int n,
+	void *data
+)
+{
+	struct this *this = data;
+
+	g_clear_pointer(&this->layout, g_free);
+	this->layout = g_memdup2(mons, (gsize)n * sizeof(*mons));
+	this->layout_n = n;
+	rf_streamer_send_layout(this->streamer, mons, n);
+}
+
+// Fires once the streamer has set up DRM (its connector name is known), i.e.
+// after every (re)connect. Re-push the cached layout so relocation doesn't drop
+// to the config-only 1-D fallback when the session's own reconnect is missed.
+static void on_connector_name(RfStreamer *s, const char *name, void *data)
+{
+	struct this *this = data;
+
+	if (this->layout != NULL)
+		rf_streamer_send_layout(
+			this->streamer, this->layout, this->layout_n
+		);
 }
 
 static int on_sigint(void *data)
@@ -266,6 +305,12 @@ int main(int argc, char *argv[])
 		G_CALLBACK(rf_vnc_server_set_desktop_name),
 		this->vnc
 	);
+	g_signal_connect(
+		this->streamer,
+		"connector-name",
+		G_CALLBACK(on_connector_name),
+		this
+	);
 	g_signal_connect(this->streamer, "frame", G_CALLBACK(on_frame), this);
 	g_signal_connect_swapped(
 		this->session,
@@ -318,11 +363,8 @@ int main(int argc, char *argv[])
 		G_CALLBACK(rf_streamer_auth),
 		this->streamer
 	);
-	g_signal_connect_swapped(
-		this->session,
-		"layout",
-		G_CALLBACK(rf_streamer_send_layout),
-		this->streamer
+	g_signal_connect(
+		this->session, "layout", G_CALLBACK(on_layout), this
 	);
 	g_signal_connect_swapped(
 		this->streamer,
@@ -345,6 +387,7 @@ int main(int argc, char *argv[])
 	g_clear_object(&this->vnc);
 	g_clear_pointer(&module, g_module_close);
 	g_clear_object(&this->config);
+	g_clear_pointer(&this->layout, g_free);
 
 	return 0;
 }
